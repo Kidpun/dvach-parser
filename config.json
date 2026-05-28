@@ -1,0 +1,10 @@
+{
+  "board": "b",
+  "mode": "latest",
+  "threads_limit": 5,
+  "thread_ids": [123456, 654321],
+  "output_format": "json",
+  "retry_count": 5,
+  "retry_delay": 3,
+  "timeout": 15
+}
