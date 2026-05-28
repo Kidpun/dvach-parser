@@ -5,6 +5,6 @@
   "thread_ids": [123456, 654321],
   "output_format": "json",
   "retry_count": 5,
-  "retry_delay": 3,
+  "retry_backoff_factor": 1,
   "timeout": 15
 }

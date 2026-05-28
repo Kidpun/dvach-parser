@@ -1,5 +1,5 @@
 """
-parser.py — автономный скрипт для парсинга 2ch.hk через JSON API.
+parser.py — автономный скрипт для парсинга 2ch.org через JSON API.
 
 Использование:
     python parser.py
@@ -53,7 +53,7 @@ def load_config(path: Path) -> dict:
 # HTTP-сессия с автоматическим retry
 # ──────────────────────────────────────────────────────────────────────────────
 
-def build_session(retry_count: int, retry_delay: int) -> cloudscraper.CloudScraper:
+def build_session(retry_count: int, retry_backoff_factor: float) -> cloudscraper.CloudScraper:
     """
     Создаёт cloudscraper-сессию с настроенным urllib3 Retry.
 
@@ -65,7 +65,7 @@ def build_session(retry_count: int, retry_delay: int) -> cloudscraper.CloudScrap
     """
     retry = Retry(
         total=retry_count,
-        backoff_factor=retry_delay,          # задержка между попытками
+        backoff_factor=retry_backoff_factor,  # задержка = backoff_factor * 2^(attempt-1)
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET"],
         raise_on_status=False,
@@ -152,7 +152,8 @@ def get_latest_thread_ids(
         log.warning("Каталог пуст или имеет неожиданный формат.")
         return []
 
-    ids = [int(t["num"]) for t in threads[:limit]]
+    # безопасно: пропускаем элементы без поля "num"
+    ids = [int(t["num"]) for t in threads[:limit] if "num" in t]
     log.info("Получено %d тредов из каталога.", len(ids))
     return ids
 
@@ -228,43 +229,47 @@ def main() -> None:
     threads_limit = cfg.get("threads_limit", 5)
     thread_ids    = cfg.get("thread_ids", [])
     out_fmt       = cfg.get("output_format", "json") # "json" | "txt"
-    retry_count   = cfg.get("retry_count", 5)
-    retry_delay   = cfg.get("retry_delay", 3)
-    timeout       = cfg.get("timeout", 15)
+    retry_count          = cfg.get("retry_count", 5)
+    retry_backoff_factor = cfg.get("retry_backoff_factor", 1)
+    timeout              = cfg.get("timeout", 15)
 
-    log.info("Плата: /%s/  Режим: %s  Формат: %s", board, mode, out_fmt)
+    # валидация board: только a-z0-9, длина 1–10
+    if not re.match(r"^[a-z0-9]{1,10}$", board):
+        raise ValueError(f"Некорректное имя раздела: {board!r}. Допустимо: a-z0-9, до 10 символов.")
 
-    # 2. Создаём сессию
-    session = build_session(retry_count, retry_delay)
+    log.info("Раздел: /%s/  Режим: %s  Формат: %s", board, mode, out_fmt)
 
-    # 3. Определяем список ID тредов
-    if mode == "latest":
-        ids = get_latest_thread_ids(session, board, threads_limit, timeout)
-    elif mode == "list":
-        ids = [int(i) for i in thread_ids]
-        log.info("Список тредов из конфига: %s", ids)
-    else:
-        log.error("Неизвестный режим: %s. Допустимые: latest, list.", mode)
-        return
+    # 2. Создаём сессию (context manager гарантирует закрытие connection pool)
+    with build_session(retry_count, retry_backoff_factor) as session:
 
-    if not ids:
-        log.error("Нет тредов для загрузки.")
-        return
-
-    # 4. Скачиваем и сохраняем каждый тред
-    save_fn = save_json if out_fmt == "json" else save_txt
-
-    for idx, thread_id in enumerate(ids, start=1):
-        log.info("[%d/%d] Обрабатываю тред %d", idx, len(ids), thread_id)
-        posts = get_thread_posts(session, board, thread_id, timeout)
-        if posts:
-            save_fn(thread_id, posts, OUTPUT_DIR)
+        # 3. Определяем список ID тредов
+        if mode == "latest":
+            ids = get_latest_thread_ids(session, board, threads_limit, timeout)
+        elif mode == "list":
+            ids = [int(i) for i in thread_ids]
+            log.info("Список тредов из конфига: %s", ids)
         else:
-            log.warning("Тред %d: постов нет, файл не создаётся.", thread_id)
+            log.error("Неизвестный режим: %s. Допустимые: latest, list.", mode)
+            return
 
-        # Небольшая пауза между запросами, чтобы не перегружать сервер
-        if idx < len(ids):
-            time.sleep(1)
+        if not ids:
+            log.error("Нет тредов для загрузки.")
+            return
+
+        # 4. Скачиваем и сохраняем каждый тред
+        save_fn = save_json if out_fmt == "json" else save_txt
+
+        for idx, thread_id in enumerate(ids, start=1):
+            log.info("[%d/%d] Обрабатываю тред %d", idx, len(ids), thread_id)
+            posts = get_thread_posts(session, board, thread_id, timeout)
+            if posts:
+                save_fn(thread_id, posts, OUTPUT_DIR)
+            else:
+                log.warning("Тред %d: постов нет, файл не создаётся.", thread_id)
+
+            # Небольшая пауза между запросами, чтобы не перегружать сервер
+            if idx < len(ids):
+                time.sleep(1)
 
     log.info("Готово. Результаты в папке: %s", OUTPUT_DIR)
 
