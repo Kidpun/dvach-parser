@@ -7,6 +7,7 @@ parser.py — автономный скрипт для парсинга 2ch.org 
 Все настройки берутся из config.json рядом со скриптом.
 """
 
+import argparse
 import json
 import logging
 import re
@@ -221,14 +222,28 @@ def save_txt(thread_id: int, posts: list[dict], out_dir: Path) -> None:
 # Основная логика
 # ──────────────────────────────────────────────────────────────────────────────
 
+def parse_cli_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="2ch.org JSON API Thread Parser")
+    parser.add_argument("-b", "--board", type=str, help="Имя раздела (например, b, news, tech)")
+    parser.add_argument("-m", "--mode", choices=["latest", "list"], help="Режим парсинга: latest или list")
+    parser.add_argument("-l", "--limit", type=int, help="Лимит тредов для режима latest")
+    parser.add_argument("-t", "--threads", nargs="+", type=int, help="Список ID тредов для режима list")
+    parser.add_argument("-f", "--format", choices=["json", "txt"], help="Формат вывода: json или txt")
+    parser.add_argument("-c", "--config", type=str, default=str(CONFIG_PATH), help="Путь к config.json")
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = parse_cli_args()
+    config_file = Path(args.config)
+
     # 1. Загружаем конфиг
-    cfg = load_config(CONFIG_PATH)
-    board         = cfg.get("board", "b")
-    mode          = cfg.get("mode", "latest")       # "latest" | "list"
-    threads_limit = cfg.get("threads_limit", 5)
-    thread_ids    = cfg.get("thread_ids", [])
-    out_fmt       = cfg.get("output_format", "json") # "json" | "txt"
+    cfg = load_config(config_file) if config_file.exists() else {}
+    board         = args.board or cfg.get("board", "b")
+    mode          = args.mode or cfg.get("mode", "latest")
+    threads_limit = args.limit or cfg.get("threads_limit", 5)
+    thread_ids    = args.threads or cfg.get("thread_ids", [])
+    out_fmt       = args.format or cfg.get("output_format", "json")
     retry_count          = cfg.get("retry_count", 5)
     retry_backoff_factor = cfg.get("retry_backoff_factor", 1)
     timeout              = cfg.get("timeout", 15)
