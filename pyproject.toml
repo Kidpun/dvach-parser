@@ -1,0 +1,20 @@
+[project]
+name = "dvach-parser"
+version = "1.1.0"
+description = "Autonomous Python script for parsing 2ch.org threads via JSON API"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "beautifulsoup4>=4.12.0",
+    "cloudscraper>=1.2.71",
+    "requests>=2.31.0",
+    "urllib3>=2.0.0"
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
