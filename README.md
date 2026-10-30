@@ -55,8 +55,9 @@ pip install -r requirements.txt
   "thread_ids": [123456, 654321],
   "output_format": "json",
   "retry_count": 5,
-  "retry_delay": 3,
-  "timeout": 15
+  "retry_backoff_factor": 1,
+  "timeout": 15,
+  "delay": 1
 }
 ```
 
@@ -65,6 +66,27 @@ pip install -r requirements.txt
 ```bash
 python3 parser.py
 ```
+
+Флаги CLI имеют приоритет над `config.json`:
+
+```bash
+python3 parser.py -b news -m latest -l 3 -f txt -o ./out
+python3 parser.py -m list -t 123456 654321 -d 2 -v
+```
+
+| Флаг | Описание |
+|------|----------|
+| `-b`, `--board` | раздел |
+| `-m`, `--mode` | `latest` или `list` |
+| `-l`, `--limit` | сколько последних тредов (для `latest`) |
+| `-t`, `--threads` | ID тредов (для `list`) |
+| `-f`, `--format` | `json` или `txt` |
+| `-o`, `--output` | папка для результатов |
+| `-d`, `--delay` | пауза между тредами, сек |
+| `-c`, `--config` | путь к `config.json` |
+| `-v`, `--verbose` | подробный лог |
+
+Коды выхода: `0` — успех, `1` — ни один тред не загружен, `2` — ошибка настроек.
 
 ---
 
@@ -78,8 +100,10 @@ python3 parser.py
 | `thread_ids`    | `array`  | Список ID тредов (для режима `list`)                 |
 | `output_format` | `string` | Формат вывода: `json` или `txt`                      |
 | `retry_count`   | `int`    | Кол-во попыток при ошибке                            |
-| `retry_delay`   | `int`    | Задержка между попытками (секунды, экспоненциальная) |
+| `retry_backoff_factor` | `float` | Множитель экспоненциальной задержки между попытками |
 | `timeout`       | `int`    | Таймаут HTTP-запроса (секунды)                       |
+| `delay`         | `float`  | Пауза между тредами (секунды)                        |
+| `output_dir`    | `string` | Папка для результатов (по умолчанию `output`)        |
 
 ---
 

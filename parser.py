@@ -3,15 +3,21 @@ parser.py — автономный скрипт для парсинга 2ch.org 
 
 Использование:
     python parser.py
+    python parser.py -b news -m latest -l 3 -f txt
+    python parser.py -m list -t 123456 654321 -o ./out
 
-Все настройки берутся из config.json рядом со скриптом.
+Настройки берутся из config.json рядом со скриптом; флаги CLI имеют приоритет.
 """
+
+from __future__ import annotations
 
 import argparse
 import json
 import logging
 import re
+import sys
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import cloudscraper
@@ -20,35 +26,99 @@ from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Логирование
-# ──────────────────────────────────────────────────────────────────────────────
+log = logging.getLogger("dvach-parser")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
-    datefmt="%H:%M:%S",
-)
-log = logging.getLogger(__name__)
+BASE_DIR = Path(__file__).parent
+CONFIG_PATH = BASE_DIR / "config.json"
+OUTPUT_DIR = BASE_DIR / "output"
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Пути
-# ──────────────────────────────────────────────────────────────────────────────
+BOARD_RE = re.compile(r"^[a-z0-9]{1,10}$")
+MODES = ("latest", "list")
+FORMATS = ("json", "txt")
 
-BASE_DIR = Path(__file__).parent          # директория скрипта
-CONFIG_PATH = BASE_DIR / "config.json"   # путь к конфигу
-OUTPUT_DIR = BASE_DIR / "output"         # директория для результатов
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Загрузка конфига
+# Настройки
 # ──────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class Settings:
+    board: str = "b"
+    mode: str = "latest"
+    threads_limit: int = 5
+    thread_ids: list[int] = field(default_factory=list)
+    output_format: str = "json"
+    output_dir: Path = OUTPUT_DIR
+    retry_count: int = 5
+    retry_backoff_factor: float = 1
+    timeout: int = 15
+    delay: float = 1.0
+
+    def validate(self) -> None:
+        """Бросает ValueError с понятным текстом, если настройки некорректны."""
+        if not BOARD_RE.match(self.board):
+            raise ValueError(
+                f"Некорректное имя раздела: {self.board!r}. Допустимо: a-z0-9, до 10 символов."
+            )
+        if self.mode not in MODES:
+            raise ValueError(f"Неизвестный режим: {self.mode!r}. Допустимые: {', '.join(MODES)}.")
+        if self.output_format not in FORMATS:
+            raise ValueError(
+                f"Неизвестный формат: {self.output_format!r}. Допустимые: {', '.join(FORMATS)}."
+            )
+        if self.threads_limit < 1:
+            raise ValueError("threads_limit должен быть >= 1.")
+        if self.timeout < 1:
+            raise ValueError("timeout должен быть >= 1.")
+        if self.retry_count < 0 or self.delay < 0:
+            raise ValueError("retry_count и delay не могут быть отрицательными.")
+        if self.mode == "list" and not self.thread_ids:
+            raise ValueError("В режиме list нужен хотя бы один ID треда (thread_ids / --threads).")
+
 
 def load_config(path: Path) -> dict:
     """Читает и возвращает конфиг из JSON-файла."""
     if not path.exists():
         raise FileNotFoundError(f"Конфиг не найден: {path}")
-    with path.open(encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with path.open(encoding="utf-8") as f:
+            cfg = json.load(f)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Конфиг {path} — невалидный JSON: {e}") from e
+    if not isinstance(cfg, dict):
+        raise ValueError(f"Конфиг {path} должен быть JSON-объектом.")
+    return cfg
+
+
+def build_settings(args: argparse.Namespace, cfg: dict) -> Settings:
+    """Собирает Settings: значения CLI > config.json > значения по умолчанию."""
+    defaults = Settings()
+
+    def pick(cli_value, key: str, default):
+        return cli_value if cli_value is not None else cfg.get(key, default)
+
+    try:
+        thread_ids = [int(i) for i in pick(args.threads, "thread_ids", defaults.thread_ids)]
+        settings = Settings(
+            board=str(pick(args.board, "board", defaults.board)),
+            mode=pick(args.mode, "mode", defaults.mode),
+            threads_limit=int(pick(args.limit, "threads_limit", defaults.threads_limit)),
+            thread_ids=thread_ids,
+            output_format=pick(args.format, "output_format", defaults.output_format),
+            output_dir=Path(pick(args.output, "output_dir", defaults.output_dir)),
+            retry_count=int(cfg.get("retry_count", defaults.retry_count)),
+            retry_backoff_factor=float(
+                cfg.get("retry_backoff_factor", defaults.retry_backoff_factor)
+            ),
+            timeout=int(cfg.get("timeout", defaults.timeout)),
+            delay=float(pick(args.delay, "delay", defaults.delay)),
+        )
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"Некорректное значение в настройках: {e}") from e
+
+    settings.validate()
+    return settings
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # HTTP-сессия с автоматическим retry
@@ -72,13 +142,13 @@ def build_session(retry_count: int, retry_backoff_factor: float) -> cloudscraper
         raise_on_status=False,
     )
     adapter = HTTPAdapter(max_retries=retry)
-    # cloudscraper — надстройка над requests, умеет решать JS-задачи Cloudflare
     session = cloudscraper.create_scraper(
         browser={"browser": "chrome", "platform": "windows", "mobile": False}
     )
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     return session
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Очистка HTML
@@ -92,16 +162,14 @@ def clean_html(raw: str) -> str:
     if not raw:
         return ""
 
-    # Заменяем <br> / <br/> на перенос строки ДО удаления тегов
+    # <br> → перенос строки ДО удаления тегов
     text = re.sub(r"<br\s*/?>", "\n", raw, flags=re.IGNORECASE)
-
-    # BeautifulSoup убирает оставшиеся теги и декодирует entities
     text = BeautifulSoup(text, "html.parser").get_text()
 
-    # Убираем лишние пустые строки (3+ подряд → 2)
+    # 3+ пустые строки подряд → 2
     text = re.sub(r"\n{3,}", "\n\n", text)
-
     return text.strip()
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Запросы к API
@@ -116,7 +184,7 @@ def fetch_json(session: cloudscraper.CloudScraper, url: str, timeout: int) -> di
         log.debug("GET %s", url)
         resp = session.get(url, timeout=timeout)
         resp.raise_for_status()
-        return resp.json()
+        data = resp.json()
     except requests.exceptions.Timeout:
         log.error("Таймаут при запросе: %s", url)
     except requests.exceptions.ConnectionError as e:
@@ -125,7 +193,14 @@ def fetch_json(session: cloudscraper.CloudScraper, url: str, timeout: int) -> di
         log.error("HTTP-ошибка (%s): %s", url, e)
     except requests.exceptions.JSONDecodeError:
         log.error("Не удалось распарсить JSON: %s", url)
+    except (requests.exceptions.RequestException, cloudscraper.exceptions.CloudflareException) as e:
+        log.error("Ошибка запроса (%s): %s", url, e)
+    else:
+        if isinstance(data, dict):
+            return data
+        log.error("Неожиданный формат ответа (ожидался объект): %s", url)
     return None
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Получение тредов
@@ -147,13 +222,12 @@ def get_latest_thread_ids(
     if data is None:
         return []
 
-    # В каталоге поле "threads" содержит список тредов
     threads = data.get("threads") or []
     if not threads:
         log.warning("Каталог пуст или имеет неожиданный формат.")
         return []
 
-    # безопасно: пропускаем элементы без поля "num"
+    # пропускаем элементы без поля "num"
     ids = [int(t["num"]) for t in threads[:limit] if "num" in t]
     log.info("Получено %d тредов из каталога.", len(ids))
     return ids
@@ -183,21 +257,20 @@ def get_thread_posts(
         return []
 
     raw_posts = threads[0].get("posts") or []
-    posts = []
-    for p in raw_posts:
-        posts.append({
-            "post_id": int(p.get("num", 0)),
-            "comment": clean_html(p.get("comment", "")),
-        })
+    posts = [
+        {"post_id": int(p.get("num", 0)), "comment": clean_html(p.get("comment", ""))}
+        for p in raw_posts
+    ]
 
     log.info("Тред %d: %d постов.", thread_id, len(posts))
     return posts
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Сохранение результатов
 # ──────────────────────────────────────────────────────────────────────────────
 
-def save_json(thread_id: int, posts: list[dict], out_dir: Path) -> None:
+def save_json(thread_id: int, posts: list[dict], out_dir: Path) -> Path:
     """Сохраняет посты треда в JSON-файл."""
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"thread_{thread_id}.json"
@@ -205,89 +278,105 @@ def save_json(thread_id: int, posts: list[dict], out_dir: Path) -> None:
     with path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
     log.info("Сохранено: %s", path)
+    return path
 
 
-def save_txt(thread_id: int, posts: list[dict], out_dir: Path) -> None:
+def save_txt(thread_id: int, posts: list[dict], out_dir: Path) -> Path:
     """Сохраняет посты треда в текстовый файл."""
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"thread_{thread_id}.txt"
     with path.open("w", encoding="utf-8") as f:
         for post in posts:
-            f.write(f"[{post['post_id']}]\n")
-            f.write(post["comment"])
-            f.write("\n\n")
+            f.write(f"[{post['post_id']}]\n{post['comment']}\n\n")
     log.info("Сохранено: %s", path)
+    return path
+
+
+SAVERS = {"json": save_json, "txt": save_txt}
+
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Основная логика
+# CLI
 # ──────────────────────────────────────────────────────────────────────────────
 
-def parse_cli_args() -> argparse.Namespace:
+def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="2ch.org JSON API Thread Parser")
-    parser.add_argument("-b", "--board", type=str, help="Имя раздела (например, b, news, tech)")
-    parser.add_argument("-m", "--mode", choices=["latest", "list"], help="Режим парсинга: latest или list")
+    parser.add_argument("-b", "--board", help="Имя раздела (например, b, news, tech)")
+    parser.add_argument("-m", "--mode", choices=MODES, help="Режим парсинга: latest или list")
     parser.add_argument("-l", "--limit", type=int, help="Лимит тредов для режима latest")
-    parser.add_argument("-t", "--threads", nargs="+", type=int, help="Список ID тредов для режима list")
-    parser.add_argument("-f", "--format", choices=["json", "txt"], help="Формат вывода: json или txt")
-    parser.add_argument("-c", "--config", type=str, default=str(CONFIG_PATH), help="Путь к config.json")
-    return parser.parse_args()
+    parser.add_argument("-t", "--threads", nargs="+", type=int, help="ID тредов для режима list")
+    parser.add_argument("-f", "--format", choices=FORMATS, help="Формат вывода: json или txt")
+    parser.add_argument("-o", "--output", help="Папка для результатов (по умолчанию ./output)")
+    parser.add_argument("-d", "--delay", type=float, help="Пауза между тредами, сек (по умолчанию 1)")
+    parser.add_argument("-c", "--config", default=str(CONFIG_PATH), help="Путь к config.json")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Подробный лог (DEBUG)")
+    return parser.parse_args(argv)
 
 
-def main() -> None:
-    args = parse_cli_args()
-    config_file = Path(args.config)
+def run(settings: Settings) -> int:
+    """Выполняет парсинг. Возвращает код выхода: 0 — всё ок, 1 — были ошибки."""
+    log.info(
+        "Раздел: /%s/  Режим: %s  Формат: %s",
+        settings.board, settings.mode, settings.output_format,
+    )
+    save = SAVERS[settings.output_format]
+    failed = 0
 
-    # 1. Загружаем конфиг
-    cfg = load_config(config_file) if config_file.exists() else {}
-    board         = args.board or cfg.get("board", "b")
-    mode          = args.mode or cfg.get("mode", "latest")
-    threads_limit = args.limit or cfg.get("threads_limit", 5)
-    thread_ids    = args.threads or cfg.get("thread_ids", [])
-    out_fmt       = args.format or cfg.get("output_format", "json")
-    retry_count          = cfg.get("retry_count", 5)
-    retry_backoff_factor = cfg.get("retry_backoff_factor", 1)
-    timeout              = cfg.get("timeout", 15)
-
-    # валидация board: только a-z0-9, длина 1–10
-    if not re.match(r"^[a-z0-9]{1,10}$", board):
-        raise ValueError(f"Некорректное имя раздела: {board!r}. Допустимо: a-z0-9, до 10 символов.")
-
-    log.info("Раздел: /%s/  Режим: %s  Формат: %s", board, mode, out_fmt)
-
-    # 2. Создаём сессию (context manager гарантирует закрытие connection pool)
-    with build_session(retry_count, retry_backoff_factor) as session:
-
-        # 3. Определяем список ID тредов
-        if mode == "latest":
-            ids = get_latest_thread_ids(session, board, threads_limit, timeout)
-        elif mode == "list":
-            ids = [int(i) for i in thread_ids]
-            log.info("Список тредов из конфига: %s", ids)
+    # context manager гарантирует закрытие connection pool
+    with build_session(settings.retry_count, settings.retry_backoff_factor) as session:
+        if settings.mode == "latest":
+            ids = get_latest_thread_ids(
+                session, settings.board, settings.threads_limit, settings.timeout
+            )
         else:
-            log.error("Неизвестный режим: %s. Допустимые: latest, list.", mode)
-            return
+            ids = settings.thread_ids
+            log.info("Список тредов: %s", ids)
 
         if not ids:
             log.error("Нет тредов для загрузки.")
-            return
-
-        # 4. Скачиваем и сохраняем каждый тред
-        save_fn = save_json if out_fmt == "json" else save_txt
+            return 1
 
         for idx, thread_id in enumerate(ids, start=1):
             log.info("[%d/%d] Обрабатываю тред %d", idx, len(ids), thread_id)
-            posts = get_thread_posts(session, board, thread_id, timeout)
+            posts = get_thread_posts(session, settings.board, thread_id, settings.timeout)
             if posts:
-                save_fn(thread_id, posts, OUTPUT_DIR)
+                save(thread_id, posts, settings.output_dir)
             else:
+                failed += 1
                 log.warning("Тред %d: постов нет, файл не создаётся.", thread_id)
 
-            # Небольшая пауза между запросами, чтобы не перегружать сервер
+            # пауза между запросами, чтобы не перегружать сервер
             if idx < len(ids):
-                time.sleep(1)
+                time.sleep(settings.delay)
 
-    log.info("Готово. Результаты в папке: %s", OUTPUT_DIR)
+    log.info("Готово. Результаты в папке: %s", settings.output_dir)
+    if failed:
+        log.warning("Не удалось загрузить тредов: %d из %d.", failed, len(ids))
+    return 1 if failed == len(ids) else 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_cli_args(argv)
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s  %(levelname)-8s  %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    config_file = Path(args.config)
+    try:
+        cfg = load_config(config_file) if config_file.exists() else {}
+        settings = build_settings(args, cfg)
+    except (ValueError, OSError) as e:
+        log.error("%s", e)
+        return 2
+
+    try:
+        return run(settings)
+    except KeyboardInterrupt:
+        log.warning("Прервано пользователем.")
+        return 130
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

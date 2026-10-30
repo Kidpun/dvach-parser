@@ -32,3 +32,18 @@ output/
 
 # Logs
 *.log
+
+# Secrets & local tooling
+.env
+.env.*
+!.env.example
+.claude/
+CLAUDE.md
+AGENTS.md
+GEMINI.md
+.cursor/
+.cursorrules
+.windsurf/
+.aider*
+.pytest_cache/
+.ruff_cache/
